@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import subprocess
 import time
 from pathlib import Path
@@ -533,18 +534,54 @@ class UDSMultiLLMFrontend(MultiLLMFrontend):
         })
 
 
+def _build_raw_cfg_from_env() -> Optional[Dict[str, Any]]:
+    """Build a synthetic raw_cfg from KVCACHED_ENGINE_PORTS / _MODELS env
+    vars.  Both are JSON arrays rendered by the parasail Helm chart.
+
+    Shape mirrors what extract_models_mapping() / _extract_sleep_config()
+    expect to see in the YAML config file, so the rest of main() stays
+    unchanged whether we got the config from YAML or env.
+    """
+    ports_json = os.environ.get("KVCACHED_ENGINE_PORTS")
+    models_json = os.environ.get("KVCACHED_ENGINE_MODELS")
+    if not ports_json or not models_json:
+        return None
+
+    ports = json.loads(ports_json)
+    models = json.loads(models_json)
+    if len(ports) != len(models):
+        raise SystemExit(
+            f"KVCACHED_ENGINE_PORTS ({len(ports)}) and _MODELS "
+            f"({len(models)}) length mismatch")
+
+    instances = [{
+        "model": m,
+        "engine": "vllm",
+        "engine_args": f"--host localhost --port {p}",
+    } for m, p in zip(models, ports)]
+    return {"instances": instances, "sleep_manager": {}}
+
+
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config_path", required=True, type=Path)
+    parser.add_argument("--config_path", type=Path)
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
 
-    cfg_path = args.config_path.expanduser().resolve()
-    if not cfg_path.is_file():
-        raise SystemExit(f"Config not found: {cfg_path}")
-
-    with cfg_path.open() as f:
-        raw_cfg = yaml.safe_load(f)
+    env_cfg = _build_raw_cfg_from_env()
+    if env_cfg is not None:
+        print("Using KVCACHED_ENGINE_PORTS / _MODELS env vars for config")
+        raw_cfg = env_cfg
+    elif args.config_path is not None:
+        cfg_path = args.config_path.expanduser().resolve()
+        if not cfg_path.is_file():
+            raise SystemExit(f"Config not found: {cfg_path}")
+        with cfg_path.open() as f:
+            raw_cfg = yaml.safe_load(f)
+    else:
+        raise SystemExit(
+            "Either --config_path or KVCACHED_ENGINE_PORTS + "
+            "KVCACHED_ENGINE_MODELS env vars must be provided")
 
     models_mapping = extract_models_mapping(raw_cfg)
     sleep_config = _extract_sleep_config(raw_cfg)
