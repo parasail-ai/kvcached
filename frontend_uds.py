@@ -116,7 +116,15 @@ class UDSLLMRouter(LLMRouter):
         return min(awake, key=lambda x: x[1])[0]
 
     async def _drain_and_sleep(self, port: int) -> bool:
-        """Wait for in-flight requests, then POST /sleep?level=2 over UDS."""
+        """Wait for in-flight requests, then POST /sleep?level=1 over UDS.
+
+        Uses level=1 (offload weights to CPU) NOT level=2 (discard weights).
+        level=2 frees GPU but cannot be restored on wake — vLLM reports it
+        as "0.00 GiB backed up in CPU and the rest 14.98 GiB DISCARDED
+        DIRECTLY", and subsequent inference produces token gibberish.
+        level=1 is slower (CPU offload + restore takes ~1s for an 8B model)
+        but actually correct.
+        """
         uds = uds_path_for_port(port)
         deadline = time.monotonic() + 10.0
         # Drain: poll vllm:num_requests_running until 0 (10s max)
@@ -145,8 +153,8 @@ class UDSLLMRouter(LLMRouter):
         try:
             connector = aiohttp.UnixConnector(path=uds)
             async with aiohttp.ClientSession(connector=connector) as s:
-                async with s.post("http://localhost/sleep?level=2",
-                                  timeout=aiohttp.ClientTimeout(total=15)) as r:
+                async with s.post("http://localhost/sleep?level=1",
+                                  timeout=aiohttp.ClientTimeout(total=30)) as r:
                     if r.status == 200:
                         self._engine_state[port]["sleeping"] = True
                         return True
