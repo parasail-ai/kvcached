@@ -12,6 +12,7 @@ This module implements a hierarchical memory management system for KV cache:
 import functools
 import threading
 import time
+import weakref
 from collections import defaultdict
 from typing import Dict, List, Optional
 
@@ -25,6 +26,51 @@ logger = get_kvcached_logger()
 
 KV_TENSOR_WAIT_TIMEOUT: float = 10.0  # seconds
 PREALLOC_THREAD_TIMEOUT: float = 2.0  # seconds
+
+# Process-wide registry of every live KVCacheManager.  Used by
+# release_all_for_sleep() so the vLLM Worker.sleep hook can release every
+# manager's CUDA pages before the engine sleeps — without us having to
+# thread an explicit handle through vLLM's call graph.  Weak-ref so dead
+# managers drop out automatically.
+_all_managers: "weakref.WeakSet[KVCacheManager]" = weakref.WeakSet()
+
+
+def release_all_for_sleep() -> None:
+    """Release CUDA pages held by every live kvcached KVCacheManager.
+
+    vLLM's Worker.sleep(level=1) offloads ``"weights"``-tagged memory via
+    its CuMemAllocator but leaves everything else resident.  kvcached's
+    KV-cache pages are allocated through CUDA VMM directly (cuMemMap),
+    bypassing CuMemAllocator entirely, so they stay mapped on the GPU
+    after sleep — wedging the GPU at near-100 % use even when the engine
+    is supposed to be idle.  In a multi-engine kvcached deployment that
+    means only the last-awake engine ever fits, and waking another fails
+    with ``free=2 MB``.
+
+    This function is the bridge: every Worker.sleep call (patched in
+    integration/vllm/patches.py) invokes it before delegating to vLLM's
+    sleep, calling :meth:`KVCacheManager.clear` on each live manager.
+    ``clear()`` unmaps reserved + in-use pages and stops the prealloc
+    thread; the manager re-arms on its next allocation, which happens
+    naturally when the engine wakes and serves a request.
+    """
+    managers = list(_all_managers)
+    if not managers:
+        return
+    logger.info(
+        "Releasing kvcached CUDA pages on sleep for %d manager(s)",
+        len(managers),
+    )
+    for mgr in managers:
+        try:
+            mgr.clear()
+        except Exception as e:  # noqa: BLE001 - keep sleep best-effort
+            logger.warning(
+                "Failed to release kvcached pages on sleep for manager "
+                "group_id=%s: %s",
+                getattr(mgr, "group_id", "?"),
+                e,
+            )
 
 
 def synchronized(method):
@@ -113,6 +159,10 @@ class KVCacheManager:
         # exist, then complete the remaining setup (reserve null block, start
         # pre-alloc thread) and finally set the event.
         threading.Thread(target=self._post_init, daemon=True).start()
+
+        # Register so release_all_for_sleep() can find us.  Weak-ref so we
+        # drop out of the set automatically when garbage-collected.
+        _all_managers.add(self)
 
     def _post_init(self):
         if self.null_block is not None:

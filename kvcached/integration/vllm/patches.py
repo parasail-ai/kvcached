@@ -1114,3 +1114,74 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
         self._mark_as_patched(_patched_init_device, "init_device")
         Worker.init_device = _patched_init_device  # type: ignore[assignment]
         return True
+
+
+class WorkerSleepPatch(VersionAwarePatch, BasePatch):
+    """Wrap Worker.sleep so kvcached releases its CUDA pages before vLLM sleeps.
+
+    vLLM's Worker.sleep(level=1) only offloads memory tagged ``"weights"``
+    via its CuMemAllocator.  kvcached allocates KV-cache pages through
+    CUDA VMM directly (cuMemMap), bypassing CuMemAllocator entirely, so
+    those pages stay resident on the GPU after sleep — which means a
+    multi-engine kvcached deployment with autoSleepOnStart=true ends up
+    with only the last-awake engine's KV cache fitting on the GPU, and
+    waking another engine fails with "free=2 MB".
+
+    The fix calls ``kvcached.kv_cache_manager.release_all_for_sleep()``
+    before delegating to the original sleep.  That iterates every live
+    KVCacheManager (registered weakly in the module) and clears its
+    pages, freeing the underlying physical GPU memory so a different
+    engine can wake into the same GPU.
+
+    No wake_up patch is needed: the manager re-arms (re-reserves the null
+    block, restarts the prealloc thread) inside ``clear()`` itself, so
+    the next allocation after wake just works.
+    """
+
+    library = "vllm"
+    target_module = "vllm.v1.worker.gpu_worker"
+    target_class = "Worker"
+    patch_name = "worker_sleep"
+
+    def apply(self, gpuworker_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_worker_sleep(gpuworker_mod)
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_worker_sleep(self, gpuworker_mod: types.ModuleType) -> bool:
+        """Patch Worker.sleep to release kvcached pages first."""
+        Worker = self._get_target_class(gpuworker_mod)
+        if Worker is None:
+            return False
+
+        if self._is_already_patched(Worker.sleep, "sleep"):
+            self.logger.debug("Worker.sleep already patched")
+            return True
+
+        original_sleep = Worker.sleep
+        logger = self.logger  # capture in closure
+
+        def _patched_sleep(self, level: int = 1, *args: Any, **kwargs: Any) -> None:
+            if not enable_kvcached():
+                return original_sleep(self, level, *args, **kwargs)
+            try:
+                # Local import: kv_cache_manager imports torch via PageAllocator,
+                # so do this inside the function to avoid an early import cycle
+                # if Worker is patched before kvcached is fully initialized.
+                from kvcached.kv_cache_manager import release_all_for_sleep
+
+                logger.info(
+                    "kvcached: releasing CUDA pages before vLLM sleep level=%d",
+                    level,
+                )
+                release_all_for_sleep()
+            except Exception as e:  # noqa: BLE001 - sleep is best-effort
+                logger.warning(
+                    "kvcached: failed to release pages on sleep: %s", e
+                )
+            return original_sleep(self, level, *args, **kwargs)
+
+        self._mark_as_patched(_patched_sleep, "sleep")
+        Worker.sleep = _patched_sleep  # type: ignore[assignment]
+        return True
